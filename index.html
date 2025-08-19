@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Mouse Magnet Survival — Multi-Mode v4 + UX</title>
+<style>
+  :root{ --bg:#f4f7ff; --grid:#e6ecff; --hud:#111827; }
+  html,body{height:100%;margin:0;background:var(--bg)}
+  body{overflow:hidden;cursor:none;font-family:ui-monospace,Menlo,Consolas,monospace}
+  canvas{display:block;width:100vw;height:100vh;image-rendering:pixelated}
+  .hud{position:fixed;inset:0;pointer-events:none;color:var(--hud)}
+  .row{display:flex;gap:10px;justify-content:space-between;padding:10px 14px;font-weight:800;text-shadow:0 2px 0 rgba(255,255,255,.7)}
+  .badge{pointer-events:auto;padding:6px 10px;border:3px solid #fff;background:#dff7ff;border-radius:10px;box-shadow:0 6px 0 #b8eaff}
+  .overlay{position:fixed;inset:0;display:grid;place-items:center}
+  .panel{pointer-events:auto;text-align:center;padding:16px;background:#fff;border:3px solid #eee;border-radius:16px;box-shadow:0 10px 0 #eaeaea}
+  h1{margin:6px 0 10px;font-size:22px}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:8px}
+  select,button{font-weight:800;border:3px solid #ffe1f6;border-radius:12px;padding:8px 10px;background:#fff0fa;box-shadow:0 6px 0 #ffd1ef;cursor:pointer}
+  button:active{transform:translateY(3px);box-shadow:0 3px 0 #ffd1ef}
+  .hidden{display:none}
+  /* progress bar */
+  .progress-container{display:flex;align-items:center;gap:4px;}
+  .progress-bar{height:14px;background:#d0e7ff;border:2px solid #fff;border-radius:6px;overflow:hidden;width:100px;box-shadow:0 3px 0 #bfdcff;}
+  .progress-inner{height:100%;background:#9bf6ff;width:0;}
+  @media (hover:none){ body{cursor:auto} }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div class="hud">
+  <div class="row">
+    <div class="badge" id="score">Score: 0</div>
+    <div class="badge" id="best">Best: 0</div>
+    <div class="badge" id="modeBadge">Mode: Original</div>
+    <div class="badge" id="powerBadge">Power-ups: —</div>
+    <div class="progress-container">
+      <span style="font-size:12px;">Next PU</span>
+      <div class="progress-bar"><div class="progress-inner" id="puProg"></div></div>
+      <span id="puCountdown" style="font-size:12px;margin-left:4px;"></span>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="panel">
+    <h1>🕹️ Mouse Magnet Survival</h1>
+    <div>Move your mouse (or touch) to dodge. One hit = game over.</div>
+    <div class="controls" style="margin-top:10px;">
+      <label for="mode">Mode:</label>
+      <select id="mode">
+        <option value="original">Original (gentle ramp)</option>
+        <option value="kaleido">Kaleidoscope (mirrored swirl)</option>
+        <option value="swarm">Swarm+ (pack AI)</option>
+        <option value="chargers">Chargers (telegraphed dashes)</option>
+      </select>
+      <label for="mirrors" id="mirrorLabel" class="hidden">Mirrors:</label>
+      <select id="mirrors" class="hidden">
+        <option value="2">2</option>
+        <option value="4">4</option>
+      </select>
+      <button id="startBtn">Start</button>
+    </div>
+    <div id="hint" style="margin-top:8px;opacity:.8"></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+
+  // ==== Pixel scaling ====
+  let PIX = 2;
+  function resize(){
+    const w=innerWidth,h=innerHeight;
+    PIX = Math.max(2, Math.min(6, Math.floor(Math.min(w,h)/180)));
+    canvas.width  = Math.floor(w/PIX);
+    canvas.height = Math.floor(h/PIX);
+    canvas.style.width = w+'px';
+    canvas.style.height= h+'px';
+  }
+  addEventListener('resize', resize); resize();
+
+  // ==== HUD ====
+  const HUDscore=document.getElementById('score');
+  const HUDbest =document.getElementById('best');
+  const modeBadge=document.getElementById('modeBadge');
+  const powerBadge=document.getElementById('powerBadge');
+  const overlay=document.getElementById('overlay');
+  const startBtn=document.getElementById('startBtn');
+  const modeSel=document.getElementById('mode');
+  const mirrorsSel=document.getElementById('mirrors');
+  const mirrorLabel=document.getElementById('mirrorLabel');
+  const hintDiv=document.getElementById('hint');
+  const puProg=document.getElementById('puProg');
+  const puCountdown=document.getElementById('puCountdown');
+
+  // ==== Palette ====
+  const PALETTE = ['#ffadad','#ffd6a5','#fdffb6','#caffbf','#9bf6ff','#a0c4ff','#bdb2ff','#ffc6ff','#fff1ba','#d0f4de','#e1f7ff','#ffe3ec'];
+  const BG='#f4f7ff', GRID='#e6ecff';
+
+  // ==== Entities/state ====
+  const player = { x: canvas.width/2, y: canvas.height/2, baseR: 4, r: 4 };
+  let enemies=[], running=false, score=0, timeAlive=0, spawnTimer=0, last=performance.now();
+  let targetX = player.x, targetY = player.y;
+
+  // Grace period (ms)
+  let graceTimer = 3000;
+
+  // Power-ups
+  let powerups=[];
+  let puTimer=0;
+  const PU_INTERVAL = 10000; // 10s
+  const PU_DESPAWN = 7000;   // 7s
+  let puBag=['friendly','mini','mirror','nuke']; // shuffled cyclically
+  function refillBag(){
+    puBag=['friendly','mini','mirror','nuke'];
+    // shuffle
+    for(let i=puBag.length-1;i>0;i--){ const j=(Math.random()*(i+1))|0; [puBag[i],puBag[j]]=[puBag[j],puBag[i]]; }
+  }
+  refillBag();
+
+  // Power-up effects state/timers
+  let ally=null; // friendly fire ally
+  let miniTimer=0;
+  let mirrorTimer=0;
+
+  // Input
+  function toLogical(cx,cy){ const r=canvas.getBoundingClientRect(); return { x:(cx-r.left)/PIX, y:(cy-r.top)/PIX }; }
+  addEventListener('mousemove', e=>{ const p=toLogical(e.clientX,e.clientY); targetX=Math.max(0,Math.min(canvas.width,p.x)); targetY=Math.max(0,Math.min(canvas.height,p.y)); });
+  addEventListener('touchmove', e=>{ if(e.touches[0]){ const p=toLogical(e.touches[0].clientX,e.touches[0].clientY); targetX=Math.max(0,Math.min(canvas.width,p.x)); targetY=Math.max(0,Math.min(canvas.height,p.y)); } }, {passive:false});
+
+  // ==== Drawing helpers ====
+  function drawGrid(){
+    ctx.fillStyle=BG; ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.globalAlpha=.6; ctx.fillStyle=GRID; const s=8;
+    for(let x=0;x<canvas.width;x+=s) ctx.fillRect(x,0,1,canvas.height);
+    for(let y=0;y<canvas.height;y+=s) ctx.fillRect(0,y,canvas.width,1);
+    ctx.globalAlpha=1;
+  }
+  function pxRect(x,y,w,h,c){ ctx.fillStyle=c; ctx.fillRect(Math.round(x),Math.round(y),Math.round(w),Math.round(h)); }
+  function pxCircle(x,y,r,col){ ctx.fillStyle=col; r|=0; for(let dy=-r;dy<=r;dy++){ for(let dx=-r;dx<=r;dx++){ if(dx*dx+dy*dy<=r*r){ ctx.fillRect((x+dx)|0,(y+dy)|0,1,1); } } } }
+  function drawBlob(e, col){ const c=col||e.color; pxCircle(e.x,e.y,e.r+1,'#ffffff'); pxCircle(e.x,e.y,e.r,c); pxRect(e.x-0.5,e.y,1,1,'#111'); }
+
+  // Draw timer ring around player when power-ups active
+  function drawTimerRing(){
+    // Determine max timer and remaining
+    let timer=0, total=1;
+    if(ally){ timer = ally.timer; total=7000; }
+    else if(miniTimer>0){ timer=miniTimer; total=3000; }
+    else if(mirrorTimer>0){ timer=mirrorTimer; total=5000; }
+    if(timer>0){
+      const segments=14;
+      const ratio = timer/total;
+      const filled = Math.ceil(segments*ratio);
+      const radius = player.r + 6; // larger ring for visibility
+      // choose colour based on active effect
+      let activeCol = '#00c2ff';
+      if(ally) activeCol = '#40e0d0'; // friendly teal
+      else if(miniTimer>0) activeCol = '#ffd6a5';
+      else if(mirrorTimer>0) activeCol = '#bdb2ff';
+      // draw segments
+      for(let i=0;i<segments;i++){
+        const ang = (i/segments)*Math.PI*2;
+        const dx=Math.cos(ang)*(radius); const dy=Math.sin(ang)*(radius);
+        const col = i<filled ? activeCol : '#e5e5ff';
+        pxRect(player.x+dx, player.y+dy,1,1,col);
+      }
+    }
+  }
+
+  // ==== Utility ====
+  function spawnEdge(){ const edge=(Math.random()*4)|0; let x,y; if(edge===0){x=-5;y=Math.random()*canvas.height;} else if(edge===1){x=canvas.width+5;y=Math.random()*canvas.height;} else if(edge===2){x=Math.random()*canvas.width;y=-5;} else {x=Math.random()*canvas.width;y=canvas.height+5;} return {x,y}; }
+  function baseEnemy(x,y,{acc,max}){ return { x,y, vx:0, vy:0, r: 3 + (Math.random()*2|0), acc, max, color: PALETTE[(Math.random()*PALETTE.length)|0] }; }
+  function limit(e,cap){ const m=Math.hypot(e.vx,e.vy); const C=cap||e.max; if(m>C){ e.vx=(e.vx/m)*C; e.vy=(e.vy/m)*C; } }
+
+  // Mirror helper: returns either real player pos or mirrored one during Chaos Mirror
+  function getChasePoint(){
+    if(mirrorTimer>0){
+      if(Math.random()<0.5){ return { x: canvas.width - player.x, y: canvas.height - player.y }; }
+    }
+    return { x: player.x, y: player.y };
+  }
+
+  // Seek toward chase point
+  function seek(e){
+    const tp = getChasePoint();
+    const dx=tp.x-e.x, dy=tp.y-e.y; const d=Math.hypot(dx,dy)||1;
+    e.vx += (dx/d)*e.acc; e.vy += (dy/d)*e.acc; limit(e); e.x+=e.vx; e.y+=e.vy;
+  }
+
+  // ==== Modes ====
+  const Modes={
+    original:{
+      label:'Original', key:'original', hint:'Gentle difficulty ramp.',
+      spawnInterval(t){ return Math.max(400, 1200 - t*0.04); },
+      burstChance(){ return 0; },
+      createEnemy(t){ const {x,y}=spawnEdge(); const acc=0.028+Math.min(0.028,t*0.00012); const max=0.55+Math.min(1.1,t*0.0007); return baseEnemy(x,y,{acc,max}); },
+      updateEnemy(e){ seek(e); },
+      drawEnemy(e){ drawBlob(e); }
+    },
+    kaleido:{
+      label:'Kaleidoscope', key:'kaleido', hint:'Mirrored reflections swirl.',
+      spawnInterval(t){ return Math.max(500, 1200 - t*0.05); },
+      burstChance(t){ return Math.min(0.12, t/40000); },
+      createEnemy(t){ const {x,y}=spawnEdge(); const acc=0.026+Math.min(0.026,t*0.0001); const max=0.5+Math.min(1.0,t*0.0006); const hue=Math.random(); return Object.assign(baseEnemy(x,y,{acc,max}),{hue,spin:0.02}); },
+      updateEnemy(e){
+        const tp=getChasePoint();
+        const dx=tp.x-e.x, dy=tp.y-e.y; const d=Math.hypot(dx,dy)||1; const ux=dx/d, uy=dy/d;
+        e.vx+=ux*e.acc; e.vy+=uy*e.acc;
+        e.vx+=-uy*e.spin; e.vy+=ux*e.spin;
+        limit(e); e.x+=e.vx; e.y+=e.vy; e.hue=(e.hue+0.0002*Math.min(50,16))%1;
+      },
+      drawEnemy(e){
+        const c=`hsl(${(e.hue*360)|0} 90% 65%)`;
+        // main sprite full opacity
+        drawBlob(e,c);
+        const mc = parseInt(mirrorsSel.value||'2',10);
+        // mirrored clones with reduced alpha for readability
+        if(mc>=2){
+          ctx.globalAlpha=0.6;
+          drawBlob({x:canvas.width-e.x,y:e.y,r:e.r},c);
+          drawBlob({x:e.x,y:canvas.height-e.y,r:e.r},c);
+          ctx.globalAlpha=1;
+        }
+        if(mc>=4){
+          ctx.globalAlpha=0.6;
+          drawBlob({x:canvas.width-e.x,y:canvas.height-e.y,r:e.r},c);
+          ctx.globalAlpha=1;
+        }
+      }
+    },
+    swarm:{
+      label:'Swarm+', key:'swarm', hint:'Boids-style pack hunts you.',
+      spawnInterval(t){ return Math.max(480, 1200 - t*0.05); },
+      burstChance(t){ return Math.min(0.1, t/45000); },
+      createEnemy(t){ const {x,y}=spawnEdge(); const acc=0.02+Math.min(0.024,t*0.0001); const max=0.5+Math.min(1.0,t*0.0006); return Object.assign(baseEnemy(x,y,{acc,max}),{role:(Math.random()<0.15?'scout':'pack')}); },
+      updateEnemy(e){
+        // boids-lite with player chase, gradually increasing cohesion over 20s
+        const ramp = Math.min(1, timeAlive/20000);
+        const radA=12 + 6*ramp; const radS=8 + 4*ramp; const A2=radA*radA, S2=radS*radS;
+        let n=0, ax=0, ay=0, cx=0, cy=0, sx=0, sy=0;
+        for(const o of enemies){ if(o===e) continue; const dx=o.x-e.x, dy=o.y-e.y; const d2=dx*dx+dy*dy; if(d2<A2){ n++; ax+=o.vx; ay+=o.vy; cx+=o.x; cy+=o.y; if(d2<S2){ const inv=1/Math.max(1,d2); sx-=dx*inv*10; sy-=dy*inv*10; } } }
+        if(n){ ax/=n; ay/=n; cx/=n; cy/=n; }
+        const tp=getChasePoint(); const dxp=tp.x-e.x, dyp=tp.y-e.y; const dp=Math.hypot(dxp,dyp)||1; const upx=dxp/dp, upy=dyp/dp;
+        const towardC = n? {x:cx-e.x,y:cy-e.y}:{x:0,y:0};
+        const close = dp<32;
+        const wSeek=0.5, wAlign=(close?0.25:0.15)*ramp, wCoh=0.05*ramp, wSep=0.5;
+        e.vx += upx*e.acc*wSeek; e.vy += upy*e.acc*wSeek;
+        e.vx += ax*0.05*wAlign;  e.vy += ay*0.05*wAlign;
+        e.vx += towardC.x*0.003*wCoh; e.vy += towardC.y*0.003*wCoh;
+        e.vx += sx*0.12*wSep;   e.vy += sy*0.12*wSep;
+        if(e.role==='scout'){ e.vx+=(Math.random()-0.5)*0.08; e.vy+=(Math.random()-0.5)*0.08; }
+        limit(e, close?e.max*(1+0.1*ramp):e.max); e.x+=e.vx; e.y+=e.vy;
+      },
+      drawEnemy(e){ drawBlob(e); }
+    },
+    chargers:{
+      label:'Chargers', key:'chargers', hint:'Telegraphed dashes. Watch lines.',
+      spawnInterval(t){ return Math.max(650, 1700 - t*0.05); },
+      burstChance(){ return 0; },
+      createEnemy(){
+        const {x,y}=spawnEdge();
+        const init = 1000 + Math.random()*900;
+        return Object.assign(baseEnemy(x,y,{acc:0.02,max:0.5}),{
+          state:'aim',
+          timer:init,
+          aimTotal:init,
+          aimPos:{x:player.x,y:player.y}
+        });
+      },
+      updateEnemy(e,dt){
+        e.timer-=dt;
+        if(e.state==='aim'){
+          if(e.timer<0){
+            e.state='dash'; e.timer=350;
+            const target=getChasePoint();
+            const dx=target.x-e.x, dy=target.y-e.y; const d=Math.hypot(dx,dy)||1; e.vx=(dx/d)*2.5; e.vy=(dy/d)*2.5;
+          } else {
+            const target=getChasePoint();
+            const dx=target.x-e.x, dy=target.y-e.y; const d=Math.hypot(dx,dy)||1; e.vx+=(dx/d)*0.01; e.vy+=(dy/d)*0.01; limit(e,0.6); e.x+=e.vx; e.y+=e.vy; e.aimPos={x:target.x,y:target.y};
+          }
+        } else { // dash
+          e.x+=e.vx; e.y+=e.vy; if(e.timer<0){ e.state='aim'; e.timer=1000+Math.random()*900; }
+        }
+      },
+      drawEnemy(e){
+        if(e.state==='aim'){
+          // dashed line towards aimPos with colour based on remaining aim time
+          const dx=e.aimPos.x-e.x, dy=e.aimPos.y-e.y;
+          const steps = Math.floor(Math.hypot(dx,dy)/4);
+          const ratio = e.aimTotal? (e.timer/e.aimTotal) : 0;
+          let lineCol;
+          if(ratio>0.6) lineCol = '#a0c4ff';
+          else if(ratio>0.3) lineCol = '#ffd6a5';
+          else lineCol = '#ffadad';
+          for(let i=0;i<steps;i++){
+            if(i%2===0){
+              const sx=e.x + (dx/steps)*i;
+              const sy=e.y + (dy/steps)*i;
+              pxRect(sx,sy,1,1,lineCol);
+            }
+          }
+          // blink sprite itself to draw attention
+          const blink=((performance.now()/200)|0)%2===0;
+          drawBlob(e, blink ? '#ffd6a5' : '#ffc6ff');
+        } else {
+          drawBlob(e,'#ffadad');
+        }
+      }
+    }
+  };
+
+  // ==== Game state ====
+  let current=Modes.original;
+  function setMode(key){
+    current = Modes[key]||Modes.original;
+    modeBadge.textContent='Mode: '+current.label;
+    // Show/hide mirror select for kaleido
+    if(key==='kaleido'){
+      mirrorLabel.classList.remove('hidden');
+      mirrorsSel.classList.remove('hidden');
+    } else {
+      mirrorLabel.classList.add('hidden');
+      mirrorsSel.classList.add('hidden');
+    }
+    updateBestBadge();
+    hintDiv.textContent=current.hint;
+  }
+  function updateBestBadge(){
+    const k='mm_best_'+current.key;
+    const best=Number(localStorage.getItem(k)||0);
+    HUDbest.textContent='Best: '+best;
+  }
+
+  function reset(){
+    enemies.length=0; powerups.length=0; ally=null;
+    score=0; timeAlive=0; spawnTimer=0; puTimer=0; miniTimer=0; mirrorTimer=0; graceTimer=3000;
+    player.baseR=4; player.r=4; player.x=canvas.width/2; player.y=canvas.height/2; targetX=player.x; targetY=player.y;
+    powerBadge.textContent='Power-ups: —';
+    puProg.style.width='0%';
+  }
+  function start(){
+    setMode(modeSel.value);
+    reset();
+    running=true; overlay.classList.add('hidden'); last=performance.now();
+    loop(last);
+  }
+  function gameOver(){
+    running=false;
+    const k='mm_best_'+current.key;
+    const best=Number(localStorage.getItem(k)||0);
+    const final=Math.floor(score);
+    if(final>best) localStorage.setItem(k,final);
+    updateBestBadge();
+    overlay.querySelector('h1').textContent='💥 Game Over!';
+    overlay.querySelector('.panel div').textContent=`You scored ${final} in ${current.label}.`;
+    overlay.classList.remove('hidden');
+  }
+
+  startBtn.addEventListener('click', start);
+  addEventListener('keydown', e=>{ if(e.key==='r'||e.key==='R'||e.key===' ') start(); });
+
+  // ==== Power-ups ====
+  function spawnPowerup(){
+    if(puBag.length===0) refillBag();
+    const type = puBag.pop();
+    let x,y,tries=0;
+    do{
+      x = 10 + Math.random()*(canvas.width-20);
+      y = 10 + Math.random()*(canvas.height-20);
+      tries++;
+    } while(Math.hypot(x-player.x,y-player.y) < 25 && tries<20);
+    // bigger radius for readability
+    powerups.push({ type, x, y, r:4, born: performance.now() });
+  }
+
+  function drawPowerup(pu){
+    // animate pulsation
+    const age=(performance.now()-pu.born)/1000;
+    const pulse=Math.sin(age*4)*0.5+0.5;
+    const baseR=pu.r;
+    const r=baseR + pulse*1;
+    if(pu.type==='friendly'){
+      // eight-point star shape: cross + diagonals, using unique teal colour
+      const col='#40e0d0';
+      // cardinal directions
+      pxRect(pu.x,pu.y-r,1,1,col);
+      pxRect(pu.x,pu.y+r,1,1,col);
+      pxRect(pu.x-r,pu.y,1,1,col);
+      pxRect(pu.x+r,pu.y,1,1,col);
+      // diagonals
+      pxRect(pu.x+r,pu.y+r,1,1,col);
+      pxRect(pu.x-r,pu.y-r,1,1,col);
+      pxRect(pu.x+r,pu.y-r,1,1,col);
+      pxRect(pu.x-r,pu.y+r,1,1,col);
+      pxRect(pu.x,pu.y,1,1,'#ffffff');
+    }
+    else if(pu.type==='mini'){
+      // diamond
+      for(let i=-r;i<=r;i++){
+        const span=r-Math.abs(i);
+        pxRect(pu.x+i,pu.y-span,1,span*2+1,'#ffd6a5');
+      }
+    }
+    else if(pu.type==='mirror'){
+      // ring: hollow circle
+      const rad=r; for(let dy=-rad;dy<=rad;dy++){ for(let dx=-rad;dx<=rad;dx++){
+        const d2=dx*dx+dy*dy;
+        if(d2<=rad*rad && d2>=(rad-1)*(rad-1)){
+          pxRect(pu.x+dx,pu.y+dy,1,1,'#bdb2ff');
+        }
+      }}
+    }
+    else if(pu.type==='nuke'){
+      // filled square
+      pxRect(pu.x-r,pu.y-r, r*2+1, r*2+1,'#ffadad');
+    }
+    // sparkle
+    if(((performance.now()/200)|0)%2===0) pxRect(pu.x-1,pu.y-2,1,1,'#fff');
+  }
+
+  function applyPowerup(pu){
+    if(pu.type==='friendly'){
+      ally = {
+        x: player.x, y: player.y, vx:0, vy:0, r:3, timer:7000, kills:0, color:'#00c2ff'
+      };
+      powerBadge.textContent='Power-ups: Friendly Fire';
+    } else if(pu.type==='mini'){
+      miniTimer = 3000;
+      player.r = Math.max(2, Math.round(player.baseR*0.6));
+      powerBadge.textContent='Power-ups: Mini Mode';
+    } else if(pu.type==='mirror'){
+      mirrorTimer = 5000;
+      powerBadge.textContent='Power-ups: Chaos Mirror';
+    } else if(pu.type==='nuke'){
+      let removed = enemies.length;
+      score += removed*3;
+      enemies.length=0;
+      for(let i=0;i<120;i++){
+        const a=Math.random()*Math.PI*2, rad= (Math.random()*Math.min(canvas.width,canvas.height))/2;
+        pxRect(player.x+Math.cos(a)*rad, player.y+Math.sin(a)*rad, 1,1, PALETTE[(Math.random()*PALETTE.length)|0]);
+      }
+      powerBadge.textContent='Power-ups: Pixel Nuke';
+    }
+  }
+
+  function updateAlly(dt){
+    if(!ally) return;
+    ally.timer -= dt;
+    let best=null, bestD=1e9;
+    for(const e of enemies){
+      const dx=e.x-ally.x, dy=e.y-ally.y, d=dx*dx+dy*dy;
+      if(d<bestD){ best=e; bestD=d; }
+    }
+    if(best){
+      const dx=best.x-ally.x, dy=best.y-ally.y; const d=Math.hypot(dx,dy)||1;
+      const acc=0.06, max=1.2;
+      ally.vx += (dx/d)*acc; ally.vy += (dy/d)*acc;
+      const sp=Math.hypot(ally.vx,ally.vy); if(sp>max){ ally.vx=(ally.vx/sp)*max; ally.vy=(ally.vy/sp)*max; }
+      ally.x += ally.vx; ally.y += ally.vy;
+      if(Math.hypot(best.x-ally.x,best.y-ally.y) < (ally.r+best.r)){
+        enemies.splice(enemies.indexOf(best),1);
+        ally.kills++; score += 5;
+      }
+    }
+    if(ally.kills>=10 || ally.timer<=0){ ally=null; powerBadge.textContent='Power-ups: —'; }
+  }
+
+  // ==== Loop ====
+  function loop(now){
+    if(!running) return;
+    const dt = Math.min(50, now-last); last=now; const dtSec=dt/1000;
+
+    timeAlive += dt; score += dtSec*10; HUDscore.textContent='Score: '+(score|0);
+
+    // update progress bar for next power-up
+    const puRatio = (PU_INTERVAL - puTimer)/PU_INTERVAL;
+    const bounded = Math.min(1, Math.max(0, puRatio));
+    puProg.style.width = (bounded*100) + 'px';
+    // show countdown in seconds
+    const remaining = Math.max(0, puTimer)/1000;
+    puCountdown.textContent = remaining.toFixed(1)+'s';
+
+    // player follows input
+    player.x = targetX; player.y = targetY;
+
+    // spawn enemies after grace
+    if(graceTimer>0){
+      graceTimer -= dt;
+    } else {
+      spawnTimer -= dt;
+      if(spawnTimer<=0){
+        spawnTimer = current.spawnInterval(timeAlive);
+        const burst = Math.random() < current.burstChance(timeAlive) ? 2 : 1;
+        for(let i=0;i<burst;i++) enemies.push(current.createEnemy(timeAlive));
+        const cap=130; if(enemies.length>cap) enemies.splice(0,enemies.length-cap);
+      }
+    }
+
+    // spawn power-ups
+    puTimer -= dt;
+    if(puTimer<=0){
+      puTimer = PU_INTERVAL;
+      spawnPowerup();
+    }
+
+    // update power-ups (despawn + collect)
+    for(let i=powerups.length-1;i>=0;i--){
+      const pu = powerups[i];
+      if(now - pu.born > PU_DESPAWN){ powerups.splice(i,1); continue; }
+      if(Math.hypot(player.x-pu.x, player.y-pu.y) < (player.r + pu.r + 1)){
+        applyPowerup(pu);
+        powerups.splice(i,1);
+      }
+    }
+
+    // timers
+    if(miniTimer>0){ miniTimer-=dt; if(miniTimer<=0){ player.r=player.baseR; powerBadge.textContent='Power-ups: —'; } }
+    if(mirrorTimer>0){ mirrorTimer-=dt; if(mirrorTimer<=0){ powerBadge.textContent='Power-ups: —'; } }
+
+    // update enemies + collisions
+    for(const e of enemies){
+      current.updateEnemy(e,dt);
+      const dx=player.x-e.x, dy=player.y-e.y;
+      if(dx*dx+dy*dy < (e.r+player.r)*(e.r+player.r)){ gameOver(); return; }
+    }
+
+    // ally update
+    updateAlly(dt);
+
+    // render
+    drawGrid();
+
+    // chaos mirror ghost cursor
+    if(mirrorTimer>0){
+      const gx = canvas.width - player.x, gy = canvas.height - player.y;
+      pxCircle(gx,gy,player.r+2,'#ffffff'); pxCircle(gx,gy,player.r+1,'#e6e6ff'); pxCircle(gx,gy,player.r,'#bdb2ff');
+    }
+
+    // player
+    pxCircle(player.x,player.y,player.r+2,'#ffffff');
+    pxCircle(player.x,player.y,player.r+1,'#d1f4ff');
+    pxCircle(player.x,player.y,player.r,'#00c2ff');
+
+    // timer ring
+    drawTimerRing();
+
+    // enemies
+    for(const e of enemies){ current.drawEnemy(e); }
+
+    // Swarm centroid marker: draw faint marker to help anticipate pack direction
+    if(current.key==='swarm' && enemies.length>2){
+      let sumX=0, sumY=0;
+      for(const e of enemies){ sumX+=e.x; sumY+=e.y; }
+      const cx=sumX/enemies.length;
+      const cy=sumY/enemies.length;
+      // draw small cross marker
+      const col='#ffa500';
+      pxRect(cx-1,cy,1,1,col);
+      pxRect(cx+1,cy,1,1,col);
+      pxRect(cx,cy-1,1,1,col);
+      pxRect(cx,cy+1,1,1,col);
+    }
+
+    // ally render
+    if(ally){ drawBlob(ally, '#00c2ff'); pxRect(ally.x, ally.y-2,1,1,'#111'); }
+
+    // power-ups
+    for(const pu of powerups){ drawPowerup(pu); }
+
+    requestAnimationFrame(loop);
+  }
+
+  // init UI
+  setMode('original');
+  startBtn.addEventListener('click', start);
+  modeSel.addEventListener('change', (e)=>{
+    setMode(e.target.value);
+  });
+})();
+</script>
+</body>
+</html>
